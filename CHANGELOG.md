@@ -19,6 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Pages keep what they last showed in this browser tab. Going back to the Dashboard, Repositories, Organizations, Storage or Activity Log shows that data at once and refreshes it in the background, instead of starting from a skeleton and waiting for the whole list again. Nothing is written to browser storage; a reload or a new tab starts fresh
 
 ### Fixed
+- A repository whose first mirror hit a gateway timeout stayed green without its releases, issues or anything else a first mirror brings (#496). The migrate call stays open for the whole clone, so a reverse proxy can give up on it while Gitea carries on, and the retry then found the repository in place and only recorded that it exists. With scheduling off nothing ever came back for the rest. Finding an existing mirror now runs a full sync, after waiting up to 30 minutes for an import Gitea is still running
+- Release assets of private GitHub repositories failed with `404 Not Found` on every sync while their releases, issues and pull requests mirrored fine, because `browser_download_url` only accepts a browser session on a private repository. They now download through GitHub's REST asset URL. Each of those downloads spends one API request and stops when the rate limit gate closes; public repositories keep the browser URL, which spends none (#497)
 - Organization cards cut off the buttons on their bottom row when the grid's columns came out narrower than that row, as on a 4K screen with five columns. Columns are now at least 30rem wide instead of 27rem, which fits the row, and a longer label such as Forgejo moves the link buttons onto a second line instead of past the card's edge
 - The Activity Log came back as an error instead of the feed once a sync had finished with a warning. A run whose release filter matched nothing on the destination leaves a job whose status is `warning`, and the feed validated the status with the repository status list, which has no such value
 - Long lists no longer put every row in the page. The Repositories page built a card for every repository even on desktop, where the cards are hidden, and the Storage table rendered every row; with 3,000 repositories the Repositories page held over 120,000 elements. Only the layout on screen is rendered now, and the mobile cards and Storage rows are virtualized like the desktop table, so a few hundred elements are on the page whatever the count
@@ -204,6 +206,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Added LFS feature documentation
   - Updated README with new features
   - Enhanced CLAUDE.md with repository status definitions
+
+### Security
+- Release assets a repository's owner links by URL are no longer trusted like files on the source. Forgejo lets an owner attach an asset by `external_url`, with any address, and mirroring that repository with release mirroring on sent the source token to that address and stored the response as a release asset on the mirror. These assets now download without the token and only from public addresses, checked again on every redirect. One that points anywhere else is skipped with a warning and does not mark the sync as failed. Assets a Gitea or Forgejo instance hosts itself keep working, private repositories and instances behind another `ROOT_URL` included.
+- The GitLab and GitHub destination client checks the address on every request and every redirect, not only when the destination is saved, so a name that later resolves to the cloud metadata address, or a redirect to it, is refused (GHSA-jpcv-7rgv-87p5). A destination token no longer follows a redirect to another host.
+- `safeFetch` connects to the address its check saw. It looked the name up a second time for the connection, and could send the request unpinned if that second answer was a blocked address.
 
 ## [3.7.1] - 2025-09-14
 

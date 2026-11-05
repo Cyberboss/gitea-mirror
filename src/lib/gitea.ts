@@ -33,8 +33,17 @@ import {
   sourceAccessToken,
 } from "./sources";
 import { triggerAllReleasesRemovedNotification } from "./notification-service";
-import { isRateLimitError } from "./rate-limit-gate";
+import {
+  RATE_LIMIT_FAST_FAIL_THRESHOLD_SECONDS,
+  RateLimitPausedError,
+  isRateLimitError,
+  markRateLimited,
+  rateLimitGateKey,
+  rateLimitResetFromResponse,
+  waitForRateLimitGate,
+} from "./rate-limit-gate";
 import { assertMirrorCredentialUpdateSupported } from "./gitea-mirror-credentials";
+import { guardedFetch, OutboundUrlError } from "./utils/outbound-url";
 import { persistMetadataPassProgress } from "./metadata-progress-store";
 import { summarizeReleaseAssets } from "./repository-storage";
 import { recordReleaseAssetStorage } from "./repository-storage-store";
@@ -68,6 +77,8 @@ import { repositoryDestinationColumns } from "./repo-utils";
 import { resolveDestinationIdentity } from "./destination-connection";
 import { withKeyedLock } from "./utils/keyed-mutex";
 import { claimRepositoryForInFlightWork } from "./utils/repo-status-claim";
+import { waitForGiteaImport } from "./gitea-import-wait";
+import type { GiteaRepoInfo } from "./gitea-enhanced";
 
 /**
  * Run the release mirror for one repository through whichever source it came
@@ -803,6 +814,58 @@ export const syncRepositoryMetadataToGitea = async ({
   }
 };
 
+/**
+ * A mirror of this source is already on the destination, so there is nothing to
+ * migrate: bring it up to date the way a sync does. This is where a retry lands
+ * after a proxy timed out on the migrate call while Gitea carried on (#496).
+ * Only recording that the mirror exists left the row green with no releases,
+ * issues or anything else a first mirror brings, and with scheduling off nothing
+ * ever came back for them.
+ */
+async function syncExistingMirror({
+  config,
+  repository,
+  owner,
+  repoName,
+  repoInfo,
+}: {
+  config: Partial<Config>;
+  repository: Repository;
+  owner: string;
+  repoName: string;
+  repoInfo: GiteaRepoInfo;
+}): Promise<void> {
+  const { getGiteaRepoInfo, syncGiteaRepoEnhanced } = await import("./gitea-enhanced");
+  const location = {
+    mirroredLocation: `${owner}/${repoName}`,
+    ...repositoryDestinationColumns(resolveDestinationIdentity(config)),
+  };
+
+  const claimed = await claimRepositoryForInFlightWork({
+    repositoryId: repository.id!,
+    set: { status: repoStatusEnum.parse("mirroring"), updatedAt: new Date(), ...location },
+  });
+
+  if (!claimed) {
+    console.log(
+      `[Idempotency] ${repository.fullName} is being mirrored or synced by another process. Skipping.`
+    );
+    return;
+  }
+
+  await waitForGiteaImport({
+    location: location.mirroredLocation,
+    initial: repoInfo,
+    readRepo: () => getGiteaRepoInfo({ config, owner, repoName }),
+  });
+
+  await syncGiteaRepoEnhanced({
+    config,
+    repository: { ...repository, ...location },
+    alreadyClaimed: true,
+  });
+}
+
 export const mirrorGithubRepoToGitea = async ({
   octokit,
   repository,
@@ -990,44 +1053,18 @@ export const mirrorGithubRepoToGitea = async ({
           // expectedLocation is recomputed below before the "mirroring" write.
         } else {
           console.log(
-            `Repository ${targetRepoName} already exists in Gitea under ${repoOwner}. Updating database status.`
+            `Repository ${targetRepoName} already exists in Gitea under ${repoOwner}. Bringing it up to date.`
           );
 
-          await syncRepositoryMetadataToGitea({
+          // The repository is there: a failure from here on keeps its location.
+          migrateSucceeded = true;
+          await syncExistingMirror({
             config,
-            octokit,
             repository,
-            giteaOwner: repoOwner,
-            giteaRepoName: targetRepoName,
-            giteaToken: decryptedConfig.giteaConfig.token,
+            owner: repoOwner,
+            repoName: targetRepoName,
+            repoInfo: existingRepoInfo,
           });
-
-          // Update database to reflect that the repository is already mirrored
-          await db
-            .update(repositories)
-            .set({
-              status: repoStatusEnum.parse("mirrored"),
-              updatedAt: new Date(),
-              lastMirrored: new Date(),
-              errorMessage: null,
-              mirroredLocation: `${repoOwner}/${targetRepoName}`,
-              ...repositoryDestinationColumns(resolveDestinationIdentity(config)),
-            })
-            .where(eq(repositories.id, repository.id!));
-
-          // Append log for "mirrored" status
-          await createMirrorJob({
-            userId: config.userId,
-            repositoryId: repository.id,
-            repositoryName: repository.name,
-            message: `Repository ${repository.name} already exists in Gitea`,
-            details: `Repository ${repository.name} was found to already exist in Gitea under ${repoOwner} and database status was updated.`,
-            status: "mirrored",
-          });
-
-          console.log(
-            `Repository ${repository.name} database status updated to mirrored`
-          );
           return;
         }
       } else {
@@ -1892,44 +1929,18 @@ export async function mirrorGitHubRepoToGiteaOrg({
           });
         } else {
           console.log(
-            `Repository ${targetRepoName} already exists in Gitea organization ${targetOwner}. Updating database status.`
+            `Repository ${targetRepoName} already exists in Gitea organization ${targetOwner}. Bringing it up to date.`
           );
 
-          await syncRepositoryMetadataToGitea({
+          // The repository is there: a failure from here on keeps its location.
+          migrateSucceeded = true;
+          await syncExistingMirror({
             config,
-            octokit,
             repository,
-            giteaOwner: targetOwner,
-            giteaRepoName: targetRepoName,
-            giteaToken: decryptedConfig.giteaConfig.token,
+            owner: targetOwner,
+            repoName: targetRepoName,
+            repoInfo: existingRepoInfo,
           });
-
-          // Update database to reflect that the repository is already mirrored
-          await db
-            .update(repositories)
-            .set({
-              status: repoStatusEnum.parse("mirrored"),
-              updatedAt: new Date(),
-              lastMirrored: new Date(),
-              errorMessage: null,
-              mirroredLocation: `${targetOwner}/${targetRepoName}`,
-              ...repositoryDestinationColumns(resolveDestinationIdentity(config)),
-            })
-            .where(eq(repositories.id, repository.id!));
-
-          // Create a mirror job log entry
-          await createMirrorJob({
-            userId: config.userId,
-            repositoryId: repository.id,
-            repositoryName: repository.name,
-            message: `Repository ${targetRepoName} already exists in Gitea organization ${targetOwner}`,
-            details: `Repository ${targetRepoName} was found to already exist in Gitea organization ${targetOwner} and database status was updated.`,
-            status: "mirrored",
-          });
-
-          console.log(
-            `Repository ${targetRepoName} database status updated to mirrored in organization ${targetOwner}`
-          );
           return;
         }
       } else {
@@ -3624,6 +3635,83 @@ export function classifyReleasesForReconciliation(
 }
 
 /**
+ * Download one release asset from its source host.
+ *
+ * GitHub: `browser_download_url` (github.com/<owner>/<repo>/releases/download/...)
+ * is meant for browsers. For a private repository it only accepts a logged-in
+ * session and answers 404 to any API token, classic or fine-grained, so those
+ * assets carry `api_url`: the REST asset URL, which with
+ * `Accept: application/octet-stream` answers 302 to a pre-signed object-storage
+ * URL (or, rarely, 200 with the content). The redirect is followed by hand so the
+ * token is never sent to the storage host, whatever the runtime's redirect header
+ * policy is.
+ *
+ * A REST download spends the same budget as any other GitHub API call but does not
+ * go through Octokit, so it answers to the rate limit gate here: nothing is sent
+ * while the gate is closed, and a refusal closes it for the assets after this one
+ * (#437).
+ *
+ * Everything else uses browser_download_url: public GitHub assets, which cost no
+ * API budget that way, and Gitea / Forgejo, whose URL accepts that instance's token.
+ *
+ * An external asset is different: the repository's owner wrote that URL, and that
+ * owner may be anybody whose repository is being mirrored. It gets no token, and
+ * it must be on the public internet at every hop, or a release could read the
+ * operator's token or their internal services into a release attachment.
+ */
+async function downloadSourceAsset(
+  doFetch: typeof fetch,
+  asset: { browser_download_url: string; api_url?: string; external?: boolean },
+  downloadAuthorization: string | null,
+  rateLimitKey: string
+): Promise<Response> {
+  if (asset.external) {
+    return guardedFetch(
+      asset.browser_download_url,
+      { headers: { Accept: "application/octet-stream" } },
+      { publicOnly: true, fetchImpl: doFetch }
+    );
+  }
+  if (asset.api_url && downloadAuthorization) {
+    await waitForRateLimitGate(
+      { key: rateLimitKey, maxWaitMs: RATE_LIMIT_FAST_FAIL_THRESHOLD_SECONDS * 1000 },
+      `GET ${asset.api_url}`
+    );
+    const first = await guardedFetch(
+      asset.api_url,
+      { headers: { Accept: "application/octet-stream", Authorization: downloadAuthorization } },
+      { maxRedirects: 0, fetchImpl: doFetch }
+    );
+    const resetAt = rateLimitResetFromResponse(first);
+    if (resetAt) {
+      markRateLimited(rateLimitKey, resetAt);
+    }
+    if (first.status < 300 || first.status >= 400) {
+      return first;
+    }
+    const location = first.headers.get("location");
+    if (!location) {
+      return first;
+    }
+    return guardedFetch(
+      new URL(location, asset.api_url).toString(),
+      { headers: { Accept: "application/octet-stream" } },
+      { fetchImpl: doFetch }
+    );
+  }
+  return guardedFetch(
+    asset.browser_download_url,
+    {
+      headers: {
+        Accept: "application/octet-stream",
+        ...(downloadAuthorization ? { Authorization: downloadAuthorization } : {}),
+      },
+    },
+    { fetchImpl: doFetch }
+  );
+}
+
+/**
  * Decide what to upload, keep and delete for one release's assets.
  *
  * Destination attachments are grouped by name because the destination happily
@@ -3749,7 +3837,13 @@ export async function reconcileReleaseAssets({
   repoOwner: string;
   repoName: string;
   giteaReleaseId: number;
-  sourceAssets: Array<{ name: string; size: number; browser_download_url: string }>;
+  sourceAssets: Array<{
+    name: string;
+    size: number;
+    browser_download_url: string;
+    api_url?: string;
+    external?: boolean;
+  }>;
   /**
    * Authorization header value for the download requests, or null for none.
    * The caller supplies it because the assets live on the repository's own
@@ -3853,18 +3947,17 @@ export async function reconcileReleaseAssets({
     }
 
     try {
-      // Download from the source host. fetch strips the Authorization header
-      // on a cross-host redirect (GitHub redirects to its object storage), so
-      // this works for both public and private release assets.
+      // Download from the source host (see downloadSourceAsset: private GitHub
+      // repositories go through the REST asset URL).
       console.log(
         `[Releases] Downloading asset: ${asset.name} (${asset.size} bytes) for ${tagName}`
       );
-      const assetResponse = await doFetch(asset.browser_download_url, {
-        headers: {
-          Accept: "application/octet-stream",
-          ...(downloadAuthorization ? { Authorization: downloadAuthorization } : {}),
-        },
-      });
+      const assetResponse = await downloadSourceAsset(
+        doFetch,
+        asset,
+        downloadAuthorization,
+        rateLimitGateKey(config.userId)
+      );
 
       if (!assetResponse.ok) {
         console.error(
@@ -3899,6 +3992,18 @@ export async function reconcileReleaseAssets({
         failed++;
       }
     } catch (assetError) {
+      // The gate is closed for longer than a request may wait: every asset left
+      // would be refused too, so stop here and let the sync report the pause.
+      if (assetError instanceof RateLimitPausedError) throw assetError;
+      // Refused by the outbound guard. Retrying cannot help, and a repository's
+      // owner should not be able to mark somebody else's mirror as failing.
+      if (assetError instanceof OutboundUrlError) {
+        console.warn(
+          `[Releases] Skipping asset ${asset.name} of ${tagName}: ${assetError.message}`
+        );
+        skipped++;
+        continue;
+      }
       console.error(
         `[Releases] Error processing asset ${asset.name}: ${
           assetError instanceof Error ? assetError.message : String(assetError)
@@ -4188,6 +4293,9 @@ export async function mirrorGitHubReleasesToGitea(params: MirrorReleasesParams) 
             name: asset.name,
             size: asset.size,
             browser_download_url: asset.browser_download_url,
+            // Private only: this URL costs a REST request per download, and a
+            // public repository's browser URL works and costs none.
+            ...(rest.repository.isPrivate ? { api_url: asset.url } : {}),
           })),
         }));
       },
@@ -4552,6 +4660,7 @@ async function mirrorSourceReleasesToGiteaLocked({
       const noteInfo = originalReleaseNote ? ` with ${originalReleaseNote.length} character changelog` : " without changelog";
       console.log(`[Releases] Successfully mirrored release: ${release.tag_name}${noteInfo}`);
     } catch (error) {
+      if (error instanceof RateLimitPausedError) throw error;
       console.error(`[Releases] Failed to mirror release ${release.tag_name}: ${error instanceof Error ? error.message : String(error)}`);
     }
   }
